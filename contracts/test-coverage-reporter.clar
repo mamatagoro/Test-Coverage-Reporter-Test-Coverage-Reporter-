@@ -26,6 +26,7 @@
         passed-tests: uint,
         failed-tests: uint,
         coverage-percentage: uint,
+        quality-score: uint,
         created-at: uint,
         last-updated: uint,
         is-active: bool
@@ -106,6 +107,50 @@
     )
 )
 
+(define-read-only (calculate-quality-score (coverage-percentage uint) (passed-tests uint) (total-tests uint))
+    (if (is-eq total-tests u0)
+        u0
+        (let
+            (
+                (pass-rate (/ (* passed-tests u100) total-tests))
+                (weighted-coverage (/ (* coverage-percentage u60) u100))
+                (weighted-pass-rate (/ (* pass-rate u40) u100))
+            )
+            (+ weighted-coverage weighted-pass-rate)
+        )
+    )
+)
+
+(define-read-only (get-suite-quality-score (suite-id uint))
+    (match (map-get? test-suites { suite-id: suite-id })
+        suite-data (ok (get quality-score suite-data))
+        err-test-suite-not-found
+    )
+)
+
+(define-read-only (compare-suite-quality (suite-id-1 uint) (suite-id-2 uint))
+    (match (map-get? test-suites { suite-id: suite-id-1 })
+        suite-1
+            (match (map-get? test-suites { suite-id: suite-id-2 })
+                suite-2
+                    (let
+                        (
+                            (score-1 (get quality-score suite-1))
+                            (score-2 (get quality-score suite-2))
+                        )
+                        (ok {
+                            suite-1-score: score-1,
+                            suite-2-score: score-2,
+                            better-suite: (if (> score-1 score-2) suite-id-1 suite-id-2),
+                            score-difference: (if (> score-1 score-2) (- score-1 score-2) (- score-2 score-1))
+                        })
+                    )
+                err-test-suite-not-found
+            )
+        err-test-suite-not-found
+    )
+)
+
 ;; Public functions
 (define-public (create-test-suite (name (string-ascii 100)) (description (string-ascii 500)))
     (let
@@ -123,6 +168,7 @@
                     passed-tests: u0,
                     failed-tests: u0,
                     coverage-percentage: u0,
+                    quality-score: u0,
                     created-at: stacks-block-height,
                     last-updated: stacks-block-height,
                     is-active: true
@@ -207,15 +253,23 @@
         (asserts! (<= coverage-percentage u100) err-invalid-coverage)
         (match (map-get? test-suites { suite-id: suite-id })
             suite-data
-                (begin
-                    (map-set test-suites
-                        { suite-id: suite-id }
-                        (merge suite-data {
-                            coverage-percentage: coverage-percentage,
-                            last-updated: stacks-block-height
-                        })
+                (let
+                    (
+                        (passed (get passed-tests suite-data))
+                        (total (get total-tests suite-data))
+                        (new-quality-score (calculate-quality-score coverage-percentage passed total))
                     )
-                    (ok true)
+                    (begin
+                        (map-set test-suites
+                            { suite-id: suite-id }
+                            (merge suite-data {
+                                coverage-percentage: coverage-percentage,
+                                quality-score: new-quality-score,
+                                last-updated: stacks-block-height
+                            })
+                        )
+                        (ok true)
+                    )
                 )
             err-test-suite-not-found
         )
@@ -261,6 +315,34 @@
     )
 )
 
+(define-public (recalculate-quality-score (suite-id uint))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (match (map-get? test-suites { suite-id: suite-id })
+            suite-data
+                (let
+                    (
+                        (coverage (get coverage-percentage suite-data))
+                        (passed (get passed-tests suite-data))
+                        (total (get total-tests suite-data))
+                        (new-quality-score (calculate-quality-score coverage passed total))
+                    )
+                    (begin
+                        (map-set test-suites
+                            { suite-id: suite-id }
+                            (merge suite-data {
+                                quality-score: new-quality-score,
+                                last-updated: stacks-block-height
+                            })
+                        )
+                        (ok new-quality-score)
+                    )
+                )
+            err-test-suite-not-found
+        )
+    )
+)
+
 ;; Private functions
 (define-private (update-suite-stats (suite-id uint) (old-status (string-ascii 10)) (new-status (string-ascii 10)))
     (match (map-get? test-suites { suite-id: suite-id })
@@ -269,6 +351,8 @@
                 (
                     (current-passed (get passed-tests suite-data))
                     (current-failed (get failed-tests suite-data))
+                    (total-tests (get total-tests suite-data))
+                    (coverage (get coverage-percentage suite-data))
                     (new-passed 
                         (if (is-eq new-status "passed")
                             (if (is-eq old-status "passed") current-passed (+ current-passed u1))
@@ -281,6 +365,7 @@
                             (if (is-eq old-status "failed") (- current-failed u1) current-failed)
                         )
                     )
+                    (new-quality-score (calculate-quality-score coverage new-passed total-tests))
                 )
                 (begin
                     (map-set test-suites
@@ -288,6 +373,7 @@
                         (merge suite-data {
                             passed-tests: new-passed,
                             failed-tests: new-failed,
+                            quality-score: new-quality-score,
                             last-updated: stacks-block-height
                         })
                     )
