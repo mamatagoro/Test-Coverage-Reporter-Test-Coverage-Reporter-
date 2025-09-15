@@ -10,10 +10,12 @@
 (define-constant err-test-case-not-found (err u104))
 (define-constant err-invalid-coverage (err u105))
 (define-constant err-unauthorized (err u106))
+(define-constant err-test-run-not-found (err u107))
 
 ;; Data Variables
 (define-data-var next-suite-id uint u1)
 (define-data-var next-test-id uint u1)
+(define-data-var next-run-id uint u1)
 
 ;; Data Maps
 (define-map test-suites
@@ -63,6 +65,23 @@
     }
 )
 
+(define-map test-run-snapshots
+    { run-id: uint }
+    {
+        suite-id: uint,
+        run-name: (string-ascii 100),
+        executor: principal,
+        total-tests: uint,
+        passed-tests: uint,
+        failed-tests: uint,
+        coverage-percentage: uint,
+        quality-score: uint,
+        execution-time: uint,
+        gas-consumed: uint,
+        snapshot-at: uint
+    }
+)
+
 ;; Read-only functions
 (define-read-only (get-contract-owner)
     contract-owner
@@ -74,6 +93,10 @@
 
 (define-read-only (get-next-test-id)
     (var-get next-test-id)
+)
+
+(define-read-only (get-next-run-id)
+    (var-get next-run-id)
 )
 
 (define-read-only (get-test-suite (suite-id uint))
@@ -148,6 +171,70 @@
                 err-test-suite-not-found
             )
         err-test-suite-not-found
+    )
+)
+
+(define-read-only (get-test-run-snapshot (run-id uint))
+    (map-get? test-run-snapshots { run-id: run-id })
+)
+
+(define-read-only (compare-test-runs (run-id-1 uint) (run-id-2 uint))
+    (match (map-get? test-run-snapshots { run-id: run-id-1 })
+        run-1
+            (match (map-get? test-run-snapshots { run-id: run-id-2 })
+                run-2
+                    (let
+                        (
+                            (quality-diff (if (> (get quality-score run-1) (get quality-score run-2))
+                                            (- (get quality-score run-1) (get quality-score run-2))
+                                            (- (get quality-score run-2) (get quality-score run-1))))
+                            (coverage-diff (if (> (get coverage-percentage run-1) (get coverage-percentage run-2))
+                                             (- (get coverage-percentage run-1) (get coverage-percentage run-2))
+                                             (- (get coverage-percentage run-2) (get coverage-percentage run-1))))
+                        )
+                        (ok {
+                            run-1-quality: (get quality-score run-1),
+                            run-2-quality: (get quality-score run-2),
+                            quality-change: quality-diff,
+                            run-1-coverage: (get coverage-percentage run-1),
+                            run-2-coverage: (get coverage-percentage run-2),
+                            coverage-change: coverage-diff,
+                            better-run: (if (> (get quality-score run-1) (get quality-score run-2)) run-id-1 run-id-2)
+                        })
+                    )
+                err-test-run-not-found
+            )
+        err-test-run-not-found
+    )
+)
+
+(define-read-only (get-quality-trend (suite-id uint))
+    (let
+        (
+            (current-run-id (var-get next-run-id))
+        )
+        (if (> current-run-id u2)
+            (match (map-get? test-run-snapshots { run-id: (- current-run-id u1) })
+                latest-run
+                    (match (map-get? test-run-snapshots { run-id: (- current-run-id u2) })
+                        previous-run
+                            (if (is-eq (get suite-id latest-run) suite-id)
+                                (ok {
+                                    trend: (if (> (get quality-score latest-run) (get quality-score previous-run)) "improving" "declining"),
+                                    change: (if (> (get quality-score latest-run) (get quality-score previous-run))
+                                              (- (get quality-score latest-run) (get quality-score previous-run))
+                                              (- (get quality-score previous-run) (get quality-score latest-run))),
+                                    latest-score: (get quality-score latest-run),
+                                    previous-score: (get quality-score previous-run)
+                                })
+                                err-test-suite-not-found
+                            )
+                        err-test-run-not-found
+                    )
+                err-test-run-not-found
+            )
+            (ok { trend: "insufficient-data", change: u0, latest-score: u0, previous-score: u0 })
+        )
     )
 )
 
@@ -336,6 +423,88 @@
                             })
                         )
                         (ok new-quality-score)
+                    )
+                )
+            err-test-suite-not-found
+        )
+    )
+)
+
+(define-public (create-test-run-snapshot (suite-id uint) (run-name (string-ascii 100)) (execution-time uint) (gas-consumed uint))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (match (map-get? test-suites { suite-id: suite-id })
+            suite-data
+                (let
+                    (
+                        (run-id (var-get next-run-id))
+                    )
+                    (begin
+                        (map-set test-run-snapshots
+                            { run-id: run-id }
+                            {
+                                suite-id: suite-id,
+                                run-name: run-name,
+                                executor: tx-sender,
+                                total-tests: (get total-tests suite-data),
+                                passed-tests: (get passed-tests suite-data),
+                                failed-tests: (get failed-tests suite-data),
+                                coverage-percentage: (get coverage-percentage suite-data),
+                                quality-score: (get quality-score suite-data),
+                                execution-time: execution-time,
+                                gas-consumed: gas-consumed,
+                                snapshot-at: stacks-block-height
+                            }
+                        )
+                        (var-set next-run-id (+ run-id u1))
+                        (ok run-id)
+                    )
+                )
+            err-test-suite-not-found
+        )
+    )
+)
+
+(define-public (auto-snapshot-on-coverage-update (suite-id uint) (coverage-percentage uint))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (asserts! (<= coverage-percentage u100) err-invalid-coverage)
+        (match (map-get? test-suites { suite-id: suite-id })
+            suite-data
+                (let
+                    (
+                        (passed (get passed-tests suite-data))
+                        (total (get total-tests suite-data))
+                        (new-quality-score (calculate-quality-score coverage-percentage passed total))
+                        (run-id (var-get next-run-id))
+                    )
+                    (begin
+                        (map-set test-suites
+                            { suite-id: suite-id }
+                            (merge suite-data {
+                                coverage-percentage: coverage-percentage,
+                                quality-score: new-quality-score,
+                                last-updated: stacks-block-height
+                            })
+                        )
+                        (map-set test-run-snapshots
+                            { run-id: run-id }
+                            {
+                                suite-id: suite-id,
+                                run-name: "coverage-update",
+                                executor: tx-sender,
+                                total-tests: total,
+                                passed-tests: passed,
+                                failed-tests: (get failed-tests suite-data),
+                                coverage-percentage: coverage-percentage,
+                                quality-score: new-quality-score,
+                                execution-time: u0,
+                                gas-consumed: u0,
+                                snapshot-at: stacks-block-height
+                            }
+                        )
+                        (var-set next-run-id (+ run-id u1))
+                        (ok run-id)
                     )
                 )
             err-test-suite-not-found
