@@ -11,6 +11,9 @@
 (define-constant err-invalid-coverage (err u105))
 (define-constant err-unauthorized (err u106))
 (define-constant err-test-run-not-found (err u107))
+(define-constant err-tag-already-exists (err u108))
+(define-constant err-tag-not-found (err u109))
+(define-constant err-max-tags-reached (err u110))
 
 ;; Data Variables
 (define-data-var next-suite-id uint u1)
@@ -80,6 +83,26 @@
         gas-consumed: uint,
         snapshot-at: uint
     }
+)
+
+(define-map suite-tags
+    { suite-id: uint, tag: (string-ascii 50) }
+    { added-at: uint, added-by: principal }
+)
+
+(define-map tag-stats
+    { tag: (string-ascii 50) }
+    {
+        total-suites: uint,
+        total-quality-score: uint,
+        average-quality: uint,
+        suite-count: uint
+    }
+)
+
+(define-map suite-tag-count
+    { suite-id: uint }
+    { tag-count: uint }
 )
 
 ;; Read-only functions
@@ -235,6 +258,51 @@
             )
             (ok { trend: "insufficient-data", change: u0, latest-score: u0, previous-score: u0 })
         )
+    )
+)
+
+(define-read-only (get-suite-tags (suite-id uint))
+    (map-get? suite-tag-count { suite-id: suite-id })
+)
+
+(define-read-only (has-tag (suite-id uint) (tag (string-ascii 50)))
+    (is-some (map-get? suite-tags { suite-id: suite-id, tag: tag }))
+)
+
+(define-read-only (get-tag-stats (tag (string-ascii 50)))
+    (map-get? tag-stats { tag: tag })
+)
+
+(define-read-only (get-suites-by-category (tag (string-ascii 50)) (min-quality uint))
+    (match (map-get? tag-stats { tag: tag })
+        stats
+            (ok {
+                tag: tag,
+                suite-count: (get suite-count stats),
+                average-quality: (get average-quality stats),
+                meets-threshold: (>= (get average-quality stats) min-quality)
+            })
+        err-tag-not-found
+    )
+)
+
+(define-read-only (compare-categories (tag-1 (string-ascii 50)) (tag-2 (string-ascii 50)))
+    (match (map-get? tag-stats { tag: tag-1 })
+        stats-1
+            (match (map-get? tag-stats { tag: tag-2 })
+                stats-2
+                    (ok {
+                        tag-1: tag-1,
+                        tag-1-quality: (get average-quality stats-1),
+                        tag-1-suites: (get suite-count stats-1),
+                        tag-2: tag-2,
+                        tag-2-quality: (get average-quality stats-2),
+                        tag-2-suites: (get suite-count stats-2),
+                        better-category: (if (> (get average-quality stats-1) (get average-quality stats-2)) tag-1 tag-2)
+                    })
+                err-tag-not-found
+            )
+        err-tag-not-found
     )
 )
 
@@ -512,6 +580,70 @@
     )
 )
 
+(define-public (add-suite-tag (suite-id uint) (tag (string-ascii 50)))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (asserts! (is-none (map-get? suite-tags { suite-id: suite-id, tag: tag })) err-tag-already-exists)
+        (match (map-get? test-suites { suite-id: suite-id })
+            suite-data
+                (let
+                    (
+                        (current-count (default-to { tag-count: u0 } (map-get? suite-tag-count { suite-id: suite-id })))
+                        (new-count (+ (get tag-count current-count) u1))
+                    )
+                    (begin
+                        (asserts! (<= new-count u10) err-max-tags-reached)
+                        (map-set suite-tags
+                            { suite-id: suite-id, tag: tag }
+                            { added-at: stacks-block-height, added-by: tx-sender }
+                        )
+                        (map-set suite-tag-count
+                            { suite-id: suite-id }
+                            { tag-count: new-count }
+                        )
+                        (update-tag-statistics tag suite-id (get quality-score suite-data) true)
+                        (ok true)
+                    )
+                )
+            err-test-suite-not-found
+        )
+    )
+)
+
+(define-public (remove-suite-tag (suite-id uint) (tag (string-ascii 50)))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (asserts! (is-some (map-get? suite-tags { suite-id: suite-id, tag: tag })) err-tag-not-found)
+        (match (map-get? test-suites { suite-id: suite-id })
+            suite-data
+                (let
+                    (
+                        (current-count (default-to { tag-count: u0 } (map-get? suite-tag-count { suite-id: suite-id })))
+                        (new-count (if (> (get tag-count current-count) u0) (- (get tag-count current-count) u1) u0))
+                    )
+                    (begin
+                        (map-delete suite-tags { suite-id: suite-id, tag: tag })
+                        (map-set suite-tag-count
+                            { suite-id: suite-id }
+                            { tag-count: new-count }
+                        )
+                        (update-tag-statistics tag suite-id (get quality-score suite-data) false)
+                        (ok true)
+                    )
+                )
+            err-test-suite-not-found
+        )
+    )
+)
+
+(define-public (bulk-tag-suite (suite-id uint) (tag-1 (string-ascii 50)) (tag-2 (string-ascii 50)))
+    (begin
+        (try! (add-suite-tag suite-id tag-1))
+        (try! (add-suite-tag suite-id tag-2))
+        (ok true)
+    )
+)
+
 ;; Private functions
 (define-private (update-suite-stats (suite-id uint) (old-status (string-ascii 10)) (new-status (string-ascii 10)))
     (match (map-get? test-suites { suite-id: suite-id })
@@ -581,6 +713,48 @@
                 }
             )
             true
+        )
+    )
+)
+
+(define-private (update-tag-statistics (tag (string-ascii 50)) (suite-id uint) (quality-score uint) (is-adding bool))
+    (match (map-get? tag-stats { tag: tag })
+        current-stats
+            (let
+                (
+                    (current-count (get suite-count current-stats))
+                    (current-total (get total-quality-score current-stats))
+                    (new-count (if is-adding (+ current-count u1) (if (> current-count u0) (- current-count u1) u0)))
+                    (new-total (if is-adding (+ current-total quality-score) (if (>= current-total quality-score) (- current-total quality-score) u0)))
+                    (new-average (if (> new-count u0) (/ new-total new-count) u0))
+                )
+                (begin
+                    (map-set tag-stats
+                        { tag: tag }
+                        {
+                            total-suites: new-count,
+                            total-quality-score: new-total,
+                            average-quality: new-average,
+                            suite-count: new-count
+                        }
+                    )
+                    true
+                )
+            )
+        (if is-adding
+            (begin
+                (map-set tag-stats
+                    { tag: tag }
+                    {
+                        total-suites: u1,
+                        total-quality-score: quality-score,
+                        average-quality: quality-score,
+                        suite-count: u1
+                    }
+                )
+                true
+            )
+            false
         )
     )
 )
