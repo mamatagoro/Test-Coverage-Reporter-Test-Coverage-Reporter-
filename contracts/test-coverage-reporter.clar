@@ -15,6 +15,9 @@
 (define-constant err-tag-not-found (err u109))
 (define-constant err-max-tags-reached (err u110))
 
+(define-constant err-gate-not-configured (err u111))
+(define-constant err-invalid-threshold (err u112))
+
 ;; Data Variables
 (define-data-var next-suite-id uint u1)
 (define-data-var next-test-id uint u1)
@@ -103,6 +106,17 @@
 (define-map suite-tag-count
     { suite-id: uint }
     { tag-count: uint }
+)
+
+(define-map release-gates
+    { suite-id: uint }
+    {
+        min-coverage: uint,
+        min-quality: uint,
+        max-failed: uint,
+        last-evaluated: uint,
+        latest-result: bool
+    }
 )
 
 ;; Read-only functions
@@ -755,6 +769,83 @@
                 true
             )
             false
+        )
+    )
+)
+
+(define-read-only (get-release-gate (suite-id uint))
+    (map-get? release-gates { suite-id: suite-id })
+)
+
+(define-read-only (is-release-ready (suite-id uint))
+    (match (map-get? release-gates { suite-id: suite-id })
+        gate
+            (match (map-get? test-suites { suite-id: suite-id })
+                suite
+                    (let
+                        (
+                            (coverage (get coverage-percentage suite))
+                            (quality (get quality-score suite))
+                            (failed (get failed-tests suite))
+                            (ready (and (>= coverage (get min-coverage gate)) (>= quality (get min-quality gate)) (<= failed (get max-failed gate))))
+                        )
+                        (ok ready)
+                    )
+                err-test-suite-not-found
+            )
+        err-gate-not-configured
+    )
+)
+
+(define-public (configure-release-gate (suite-id uint) (min-coverage uint) (min-quality uint) (max-failed uint))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (asserts! (<= min-coverage u100) err-invalid-coverage)
+        (asserts! (<= min-quality u100) err-invalid-threshold)
+        (map-set release-gates
+            { suite-id: suite-id }
+            {
+                min-coverage: min-coverage,
+                min-quality: min-quality,
+                max-failed: max-failed,
+                last-evaluated: u0,
+                latest-result: false
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (evaluate-release-readiness (suite-id uint))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (match (map-get? release-gates { suite-id: suite-id })
+            gate
+                (match (map-get? test-suites { suite-id: suite-id })
+                    suite
+                        (let
+                            (
+                                (coverage (get coverage-percentage suite))
+                                (quality (get quality-score suite))
+                                (failed (get failed-tests suite))
+                                (ready (and (>= coverage (get min-coverage gate)) (>= quality (get min-quality gate)) (<= failed (get max-failed gate))))
+                            )
+                            (begin
+                                (map-set release-gates { suite-id: suite-id } (merge gate { last-evaluated: stacks-block-height, latest-result: ready }))
+                                (ok {
+                                    ready: ready,
+                                    coverage: coverage,
+                                    quality: quality,
+                                    failed: failed,
+                                    min-coverage: (get min-coverage gate),
+                                    min-quality: (get min-quality gate),
+                                    max-failed: (get max-failed gate)
+                                })
+                            )
+                        )
+                    err-test-suite-not-found
+                )
+            err-gate-not-configured
         )
     )
 )
