@@ -849,3 +849,74 @@
         )
     )
 )
+;; Suite Metadata Feature
+(define-constant err-metadata-not-found (err u113))
+(define-constant err-max-metadata-reached (err u114))
+
+(define-map suite-metadata
+    { suite-id: uint, key: (string-ascii 50) }
+    { value: (string-ascii 200), set-at: uint, set-by: principal }
+)
+
+(define-map suite-metadata-count
+    { suite-id: uint }
+    { count: uint }
+)
+
+(define-read-only (get-metadata (suite-id uint) (key (string-ascii 50)))
+    (map-get? suite-metadata { suite-id: suite-id, key: key })
+)
+
+(define-read-only (get-metadata-count (suite-id uint))
+    (map-get? suite-metadata-count { suite-id: suite-id })
+)
+
+(define-public (set-metadata (suite-id uint) (key (string-ascii 50)) (value (string-ascii 200)))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (match (map-get? test-suites { suite-id: suite-id })
+            suite-data
+                (let
+                    (
+                        (existing (map-get? suite-metadata { suite-id: suite-id, key: key }))
+                        (current-count (default-to { count: u0 } (map-get? suite-metadata-count { suite-id: suite-id })))
+                        (new-count (if (is-none existing) (+ (get count current-count) u1) (get count current-count)))
+                    )
+                    (begin
+                        (asserts! (<= new-count u50) err-max-metadata-reached)
+                        (map-set suite-metadata
+                            { suite-id: suite-id, key: key }
+                            { value: value, set-at: stacks-block-height, set-by: tx-sender }
+                        )
+                        (map-set suite-metadata-count
+                            { suite-id: suite-id }
+                            { count: new-count }
+                        )
+                        (ok true)
+                    )
+                )
+            err-test-suite-not-found
+        )
+    )
+)
+
+(define-public (remove-metadata (suite-id uint) (key (string-ascii 50)))
+    (begin
+        (asserts! (can-modify-suite suite-id tx-sender) err-unauthorized)
+        (asserts! (is-some (map-get? suite-metadata { suite-id: suite-id, key: key })) err-metadata-not-found)
+        (let
+            (
+                (current-count (default-to { count: u0 } (map-get? suite-metadata-count { suite-id: suite-id })))
+                (new-count (if (> (get count current-count) u0) (- (get count current-count) u1) u0))
+            )
+            (begin
+                (map-delete suite-metadata { suite-id: suite-id, key: key })
+                (map-set suite-metadata-count
+                    { suite-id: suite-id }
+                    { count: new-count }
+                )
+                (ok true)
+            )
+        )
+    )
+)
